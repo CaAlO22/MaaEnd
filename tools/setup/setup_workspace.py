@@ -159,7 +159,9 @@ ARCH_VARIANT_HINTS: dict[str, tuple[str, ...]] = {
     "x86_64": ("x86_64", "amd64", "x64"),
     "aarch64": ("aarch64", "arm64"),
 }
-TIMEOUT: int = 30
+# 下载超时与重试默认值，可被命令行 --timeout / --retries 覆盖。
+TIMEOUT: float = 30
+RETRIES: int = 1
 CACHE_DIR: Path = PROJECT_BASE / ".cache"
 VERSION_FILE_NAME: str = "version.json"
 
@@ -557,13 +559,56 @@ def clean_cache() -> None:
         print(Console.warn(t("wrn_cache_clean_failed", path=CACHE_DIR, error=e)))
 
 
+class DownloadTimeoutError(Exception):
+    """单次下载因连接/读取超时中断，可由 download_file 重试。"""
+
+
 def download_file(
     url: str,
     dest_path: Path,
     resume: bool = False,
     extra_headers: dict[str, str] | None = None,
 ) -> bool:
-    """下载文件到指定路径。extra_headers 仅在初始请求携带，不跟随重定向。"""
+    """下载文件；仅在超时中断时按 RETRIES 自动重试。"""
+    for attempt in range(1, RETRIES + 2):
+        try:
+            return _download_file_once(url, dest_path, resume, extra_headers)
+        except DownloadTimeoutError:
+            print()
+            if attempt > RETRIES:
+                print(
+                    Console.err(
+                        t(
+                            "err_download_timeout",
+                            timeout=f"{TIMEOUT:g}",
+                            retries=RETRIES,
+                        )
+                    )
+                )
+                return False
+            print(
+                Console.warn(
+                    t(
+                        "wrn_download_timeout_retry",
+                        timeout=f"{TIMEOUT:g}",
+                        attempt=attempt,
+                        retries=RETRIES,
+                    )
+                )
+            )
+    return False
+
+
+def _download_file_once(
+    url: str,
+    dest_path: Path,
+    resume: bool = False,
+    extra_headers: dict[str, str] | None = None,
+) -> bool:
+    """下载文件到指定路径。extra_headers 仅在初始请求携带，不跟随重定向。
+
+    :return: True 成功、False 非超时失败；连接/读取超时时抛出 DownloadTimeoutError。
+    """
 
     def to_percentage(current: float, total: float) -> str:
         return f"{(current / total) * 100:.1f}%" if total > 0 else ""
@@ -709,7 +754,11 @@ def download_file(
     except urllib.error.HTTPError as e:
         print(Console.err(t("err_network_error_with_code", reason=e.reason, code=e.code)))
     except urllib.error.URLError as e:
+        if isinstance(e.reason, TimeoutError):
+            raise DownloadTimeoutError from e
         print(Console.err(t("err_network_error", reason=e.reason)))
+    except TimeoutError as e:
+        raise DownloadTimeoutError from e
     except Exception as e:
         print(Console.err(t("err_download_failed", error_type=type(e).__name__, error=e)))
     return False
@@ -1834,6 +1883,7 @@ def _is_cn_locale() -> bool:
 
 
 def main() -> None:
+    global TIMEOUT, RETRIES
     init_local()
 
     if _is_cn_locale():
@@ -1847,6 +1897,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="setup-workspace", description=t("description"))
     parser.add_argument("--update", action="store_true", help=t("arg_update"))
     parser.add_argument("--clean-cache", action="store_true", help=t("arg_clean_cache"))
+    parser.add_argument(
+        "--timeout", type=float, default=TIMEOUT, metavar="SEC",
+        help=t("arg_timeout"),
+    )
+    parser.add_argument(
+        "--retries", type=int, default=RETRIES, metavar="N",
+        help=t("arg_retries"),
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--cpp-algo-pr", type=int, default=None, metavar="N",
@@ -1857,6 +1915,16 @@ def main() -> None:
         help=t("arg_cpp_algo_run"),
     )
     args = parser.parse_args()
+
+    # 应用命令行传入的超时/重试设置，供 download_file 与各 API 请求使用。
+    if args.timeout <= 0:
+        print(Console.err(t("err_invalid_timeout")))
+        sys.exit(2)
+    if args.retries < 0:
+        print(Console.err(t("err_invalid_retries")))
+        sys.exit(2)
+    TIMEOUT = args.timeout
+    RETRIES = args.retries
 
     if args.clean_cache:
         clean_cache()
